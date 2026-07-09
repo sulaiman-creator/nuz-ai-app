@@ -1,8 +1,6 @@
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
-const { Anthropic } = require('@anthropic-ai/sdk');
-const { GoogleGenerativeAI } = require('@google/generative-ai');
 const path = require('path');
 const { db, admin } = require('./firebase');
 
@@ -16,11 +14,10 @@ app.use(express.json({ limit: '50mb' })); // Support large image uploads
 app.use(express.static(path.join(__dirname, 'dist')));
 
 // Initialize API Keys
-const claudeApiKey = process.env.CLAUDE_API_KEY;
-const geminiApiKey = process.env.GEMINI_API_KEY;
+const nvidiaApiKey = process.env.NVIDIA_API_KEY || "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";
 
-if (!claudeApiKey && !geminiApiKey) {
-    console.warn("WARNING: Neither CLAUDE_API_KEY nor GEMINI_API_KEY is configured in environment variables.");
+if (!nvidiaApiKey) {
+    console.warn("WARNING: NVIDIA_API_KEY is not configured in environment variables.");
 }
 
 const getCompanyContext = () => {
@@ -146,9 +143,9 @@ app.post('/api/chat', async (req, res) => {
         let userMessageText = lastMessage?.content || '';
 
         // Handle offline mockup if no API keys are supplied
-        if (!claudeApiKey && !geminiApiKey) {
+        if (!nvidiaApiKey) {
             return res.json({
-                message: "Hello! I am Nuz. I see that your API credentials are not configured in Cloud Run. Please set CLAUDE_API_KEY or GEMINI_API_KEY in the environment variables to activate my live cognitive core!"
+                message: "Hello! I am Nuz. I see that your API credentials are not configured in Cloud Run. Please set NVIDIA_API_KEY in the environment variables to activate my live cognitive core!"
             });
         }
 
@@ -318,215 +315,87 @@ app.post('/api/chat', async (req, res) => {
 
         const fullSystemPrompt = (systemInstruction ? `${SYSTEM_INSTRUCTION}\n\nUSER CUSTOM SYSTEM INSTRUCTIONS:\n${systemInstruction}` : SYSTEM_INSTRUCTION) + activeContext;
 
-        let claudeError = "";
-        let geminiError = "";
+        let nvidiaError = "";
 
-        // Execute Claude Core (NUZ Mind)
-        const runClaude = async () => {
-            if (!claudeApiKey) {
-                claudeError = "Claude API Key is missing in env.";
+        // Execute Nvidia Core (DeepSeek-v4-flash)
+        const runNvidia = async () => {
+            if (!nvidiaApiKey) {
+                nvidiaError = "Nvidia API Key is missing in env.";
                 return false;
             }
-            const sdk = new Anthropic({ apiKey: claudeApiKey });
-            const claudeModels = ["claude-sonnet-4-6", "claude-3-5-sonnet-20241022", "claude-3-5-sonnet-latest"];
-            
-            for (const modelName of claudeModels) {
-                try {
-                    console.log(`Attempting Claude model: ${modelName}`);
-                    let contentBlocks = [];
-                    let claudeUserMessage = userMessageText;
-
-                    if (attachment && attachment.type === 'document') {
-                        claudeUserMessage = `[ATTACHED FILE: ${attachment.name}]\n${attachment.content}\n\nUser Question: ${userMessageText}`;
-                    }
-                    contentBlocks.push({ type: "text", text: claudeUserMessage });
-
-                    if (attachment && attachment.type === 'image' && attachment.base64) {
-                        const matches = attachment.base64.match(/^data:(image\/[a-zA-Z]+);base64,(.+)$/);
-                        if (matches && matches.length === 3) {
-                            contentBlocks.push({
-                                type: "image",
-                                source: { type: "base64", media_type: matches[1], data: matches[2] }
-                            });
-                        }
-                    }
-
-                    // Robust history sanitization for Claude: ensure strictly alternating user/assistant roles,
-                    // starting with user, ending with assistant, and merging consecutive identical roles.
-                    const rawClaudeHistory = messages.slice(0, -1);
-                    const mappedClaude = rawClaudeHistory.map(msg => ({
-                        role: msg.role === 'model' ? 'assistant' : 'user',
+            try {
+                console.log("Attempting Nvidia DeepSeek model: deepseek-ai/deepseek-v4-flash");
+                
+                const apiMessages = [];
+                const rawHistory = messages.slice(0, -1);
+                for (const msg of rawHistory) {
+                    apiMessages.push({
+                        role: msg.role === 'model' || msg.role === 'assistant' ? 'assistant' : 'user',
                         content: msg.content || ''
-                    })).filter(msg => msg.content.trim() !== '');
-
-                    const sanitizedClaudeHistory = [];
-                    for (const msg of mappedClaude) {
-                        if (sanitizedClaudeHistory.length > 0 && sanitizedClaudeHistory[sanitizedClaudeHistory.length - 1].role === msg.role) {
-                            sanitizedClaudeHistory[sanitizedClaudeHistory.length - 1].content += "\n\n" + msg.content;
-                        } else {
-                            sanitizedClaudeHistory.push(msg);
-                        }
-                    }
-                    while (sanitizedClaudeHistory.length > 0 && sanitizedClaudeHistory[0].role !== 'user') {
-                        sanitizedClaudeHistory.shift();
-                    }
-                    while (sanitizedClaudeHistory.length > 0 && sanitizedClaudeHistory[sanitizedClaudeHistory.length - 1].role !== 'assistant') {
-                        sanitizedClaudeHistory.pop();
-                    }
-                    
-                    sanitizedClaudeHistory.push({ role: "user", content: contentBlocks });
-
-                    const responseMessage = await sdk.messages.create({
-                        model: modelName,
-                        max_tokens: 1500,
-                        system: fullSystemPrompt,
-                        messages: sanitizedClaudeHistory
                     });
-                    responseText = responseMessage.content[0].text;
-                    console.log(`🟢 Claude model SUCCESS: ${modelName}`);
-                    return true;
-                } catch (err) {
-                    console.warn(`Claude model ${modelName} failed:`, err.message);
-                    claudeError = err.message;
-                    // Fast-fail if credentials/billing/quota issues arise
-                    const errMsg = (err.message || "").toLowerCase();
-                    const isBillingOrQuota = 
-                        errMsg.includes('depleted') || 
-                        errMsg.includes('billing') || 
-                        errMsg.includes('429') || 
-                        errMsg.includes('quota') || 
-                        errMsg.includes('exhausted') || 
-                        errMsg.includes('api key') || 
-                        errMsg.includes('not valid') ||
-                        errMsg.includes('invalid') ||
-                        errMsg.includes('credit') ||
-                        err.status === 429 ||
-                        err.statusCode === 429 ||
-                        err.status === 403 ||
-                        err.statusCode === 403 ||
-                        err.status === 401 ||
-                        err.statusCode === 401;
-
-                    if (isBillingOrQuota) {
-                        console.warn("Claude API key, billing, or quota issue. Skipping other Claude models instantly.");
-                        break;
-                    }
                 }
-            }
-            return false;
-        };
 
-        // Execute Gemini Core (NUZ Core)
-        const runGemini = async () => {
-            if (!geminiApiKey) {
-                geminiError = "Gemini API Key is missing in env.";
+                let finalUserContent = userMessageText;
+                if (attachment && attachment.type === 'document') {
+                    finalUserContent = `[ATTACHED FILE: ${attachment.name}]\n${attachment.content}\n\nUser Question: ${userMessageText}`;
+                } else if (attachment && attachment.type === 'image') {
+                    finalUserContent = `[ATTACHED IMAGE: ${attachment.name} (Image input not supported by this cognitive core)]\n\nUser Question: ${userMessageText}`;
+                }
+                apiMessages.push({
+                    role: 'user',
+                    content: finalUserContent
+                });
+
+                const response = await fetch("https://integrate.api.nvidia.com/v1/chat/completions", {
+                    method: "POST",
+                    headers: {
+                        "Content-Type": "application/json",
+                        "Authorization": `Bearer ${nvidiaApiKey}`
+                    },
+                    body: JSON.stringify({
+                        model: "deepseek-ai/deepseek-v4-flash",
+                        messages: [
+                            { role: "system", content: fullSystemPrompt },
+                            ...apiMessages
+                        ],
+                        temperature: 1,
+                        top_p: 0.95,
+                        max_tokens: 16384,
+                        chat_template_kwargs: {
+                            thinking: true,
+                            reasoning_effort: "high"
+                        },
+                        stream: false
+                    })
+                });
+
+                if (!response.ok) {
+                    const errText = await response.text();
+                    throw new Error(`Nvidia API error: ${response.status} - ${errText}`);
+                }
+
+                const data = await response.json();
+                const message = data.choices?.[0]?.message;
+                const content = message?.content || '';
+                const reasoning = message?.reasoning || message?.reasoning_content || '';
+                responseText = reasoning 
+                    ? `<details>\n<summary>Thinking Process</summary>\n\n${reasoning}\n</details>\n\n${content}`
+                    : content;
+
+                console.log("🟢 Nvidia model SUCCESS: deepseek-ai/deepseek-v4-flash");
+                return true;
+            } catch (err) {
+                console.warn("Nvidia model failed:", err.message);
+                nvidiaError = err.message;
                 return false;
             }
-            const genAI = new GoogleGenerativeAI(geminiApiKey);
-            const geminiModels = ["gemini-1.5-flash", "gemini-1.5-pro", "gemini-flash-latest"];
-            
-            for (const modelName of geminiModels) {
-                try {
-                    console.log(`Attempting Gemini model: ${modelName}`);
-                    const model = genAI.getGenerativeModel({
-                        model: modelName,
-                        systemInstruction: fullSystemPrompt
-                    });
-
-                    // Robust history sanitization for Gemini: ensure strictly alternating user/model roles,
-                    // starting with user, ending with model, and merging consecutive identical roles.
-                    const rawGeminiHistory = messages.slice(0, -1);
-                    const mappedGemini = rawGeminiHistory.map(msg => ({
-                        role: msg.role === 'model' ? 'model' : 'user',
-                        parts: [{ text: msg.content || '' }]
-                    })).filter(msg => msg.parts[0].text.trim() !== '');
-
-                    const sanitizedHistory = [];
-                    for (const msg of mappedGemini) {
-                        if (sanitizedHistory.length > 0 && sanitizedHistory[sanitizedHistory.length - 1].role === msg.role) {
-                            sanitizedHistory[sanitizedHistory.length - 1].parts[0].text += "\n\n" + msg.parts[0].text;
-                        } else {
-                            sanitizedHistory.push(msg);
-                        }
-                    }
-                    while (sanitizedHistory.length > 0 && sanitizedHistory[0].role !== 'user') {
-                        sanitizedHistory.shift();
-                    }
-                    while (sanitizedHistory.length > 0 && sanitizedHistory[sanitizedHistory.length - 1].role !== 'model') {
-                        sanitizedHistory.pop();
-                    }
-
-                    const chat = model.startChat({ history: sanitizedHistory });
-
-                    let promptParts = [userMessageText];
-                    if (attachment && attachment.type === 'document') {
-                        promptParts[0] = `[ATTACHED FILE: ${attachment.name}]\n${attachment.content}\n\nUser Question: ${userMessageText}`;
-                    }
-
-                    if (attachment && attachment.type === 'image' && attachment.base64) {
-                        const matches = attachment.base64.match(/^data:(image\/[a-zA-Z]+);base64,(.+)$/);
-                        if (matches && matches.length === 3) {
-                            promptParts.push({
-                                inlineData: { data: matches[2], mimeType: matches[1] }
-                            });
-                        }
-                    }
-
-                    const result = await chat.sendMessage(promptParts);
-                    const response = await result.response;
-                    responseText = response.text();
-                    console.log(`🟢 Gemini model SUCCESS: ${modelName}`);
-                    return true;
-                } catch (err) {
-                    console.warn(`Gemini model ${modelName} failed:`, err.message);
-                    geminiError = err.message;
-                    // Fast-fail if credentials/billing/quota issues arise
-                    const errMsg = (err.message || "").toLowerCase();
-                    const isBillingOrQuota = 
-                        errMsg.includes('depleted') || 
-                        errMsg.includes('billing') || 
-                        errMsg.includes('429') || 
-                        errMsg.includes('quota') || 
-                        errMsg.includes('exhausted') || 
-                        errMsg.includes('api key') || 
-                        errMsg.includes('not valid') ||
-                        errMsg.includes('invalid') ||
-                        errMsg.includes('credit') ||
-                        err.status === 429 ||
-                        err.statusCode === 429 ||
-                        err.status === 403 ||
-                        err.statusCode === 403 ||
-                        err.status === 401 ||
-                        err.statusCode === 401;
-
-                    if (isBillingOrQuota) {
-                        console.warn("Gemini API key, billing, or quota issue. Skipping other Gemini models instantly.");
-                        break;
-                    }
-                }
-            }
-            return false;
         };
 
-        // Dual-Engine priority flow based on user's preference
-        let success = false;
-        if (requestedModel === 'claude') {
-            success = await runClaude();
-            if (!success) {
-                console.log("Claude prioritized model failed or unavailable. Falling back to Gemini...");
-                success = await runGemini();
-            }
-        } else {
-            success = await runGemini();
-            if (!success) {
-                console.log("Gemini prioritized model failed or unavailable. Falling back to Claude...");
-                success = await runClaude();
-            }
-        }
+        let success = await runNvidia();
 
         if (!success || !responseText) {
             return res.status(500).json({ 
-                error: `Cognitive cores failed to respond. Claude: ${claudeError || 'Not tried'} | Gemini: ${geminiError || 'Not tried'}` 
+                error: `Cognitive cores failed to respond. Nvidia: ${nvidiaError || 'Not tried'}` 
             });
         }
 
@@ -626,6 +495,12 @@ app.get('*', (req, res) => {
     res.sendFile(path.join(__dirname, 'dist', 'index.html'));
 });
 
-app.listen(port, () => {
-    console.log(`Nuz Workspace Backend running on port ${port}`);
-});
+// Only start listening when run directly (not on Vercel serverless)
+if (process.env.VERCEL !== '1') {
+    app.listen(port, () => {
+        console.log(`Nuz Workspace Backend running on port ${port}`);
+    });
+}
+
+// Export for Vercel serverless function handler
+module.exports = app;

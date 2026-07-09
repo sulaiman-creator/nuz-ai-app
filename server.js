@@ -1,8 +1,6 @@
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
-const { Anthropic } = require('@anthropic-ai/sdk');
-const { GoogleGenerativeAI } = require('@google/generative-ai');
 const { VertexAI } = require('@google-cloud/vertexai');
 const path = require('path');
 const { db, admin } = require('./firebase');
@@ -21,11 +19,10 @@ const staticPath = fs.existsSync(path.join(__dirname, 'dist'))
 app.use(express.static(staticPath));
 
 // Initialize API Keys
-const claudeApiKey = process.env.CLAUDE_API_KEY;
-const geminiApiKey = process.env.GEMINI_API_KEY;
+const nvidiaApiKey = process.env.NVIDIA_API_KEY || "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";
 
-if (!claudeApiKey && !geminiApiKey) {
-    console.warn("WARNING: Neither CLAUDE_API_KEY nor GEMINI_API_KEY is configured in environment variables.");
+if (!nvidiaApiKey) {
+    console.warn("WARNING: NVIDIA_API_KEY is not configured in environment variables.");
 }
 
 // Initialize Vertex AI Client (Primary Engine utilizing GCP project cprnd-496814)
@@ -317,8 +314,8 @@ const runLocalBrain = async (email, userMessageText) => {
         };
     }
 
-    if (!geminiApiKey) {
-        console.log("No Gemini API key. Synthesizing offline response from matched documents.");
+    if (!nvidiaApiKey) {
+        console.log("No Nvidia API key. Synthesizing offline response from matched documents.");
         return {
             success: true,
             text: synthesizeOfflineResponse(matchedDocs, userMessageText),
@@ -343,27 +340,50 @@ ${contextStr}
 `;
 
     try {
-        const genAI = new GoogleGenerativeAI(geminiApiKey);
-        const modelName = "gemini-1.5-flash";
-        const model = genAI.getGenerativeModel({
-            model: modelName,
-            systemInstruction: localSystemPrompt,
-            generationConfig: {
+        console.log("Attempting local brain with Nvidia DeepSeek model...");
+        const response = await fetch("https://integrate.api.nvidia.com/v1/chat/completions", {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+                "Authorization": `Bearer ${nvidiaApiKey}`
+            },
+            body: JSON.stringify({
+                model: "deepseek-ai/deepseek-v4-flash",
+                messages: [
+                    { role: "system", content: localSystemPrompt },
+                    { role: "user", content: userMessageText }
+                ],
                 temperature: 0.1,
-                maxOutputTokens: 2048
-            }
+                top_p: 0.95,
+                max_tokens: 4096,
+                chat_template_kwargs: {
+                    thinking: true,
+                    reasoning_effort: "high"
+                },
+                stream: false
+            })
         });
 
-        const chat = model.startChat({ history: [] });
-        const result = await chat.sendMessage(userMessageText);
-        const response = await result.response;
+        if (!response.ok) {
+            const errText = await response.text();
+            throw new Error(`Nvidia API error: ${response.status} - ${errText}`);
+        }
+
+        const data = await response.json();
+        const message = data.choices?.[0]?.message;
+        const content = message?.content || '';
+        const reasoning = message?.reasoning || message?.reasoning_content || '';
+        const responseText = reasoning 
+            ? `<details>\n<summary>Thinking Process</summary>\n\n${reasoning}\n</details>\n\n${content}`
+            : content;
+
         return { 
             success: true, 
-            text: response.text(),
+            text: responseText,
             isLocal: true
         };
     } catch (err) {
-        console.warn("Local brain call failed (e.g. key depleted). Falling back to offline synthesis.", err.message);
+        console.warn("Local brain call failed. Falling back to offline synthesis.", err.message);
         return {
             success: true,
             text: synthesizeOfflineResponse(matchedDocs, userMessageText),
@@ -758,293 +778,96 @@ app.post('/api/chat', async (req, res) => {
 
         const fullSystemPrompt = (systemInstruction ? `${SYSTEM_INSTRUCTION}\n\nUSER CUSTOM SYSTEM INSTRUCTIONS:\n${systemInstruction}` : SYSTEM_INSTRUCTION) + activeContext;
 
-        let claudeError = "";
-        let geminiError = "";
-        let vertexError = "";
+        let nvidiaError = "";
 
-        // Execute Vertex AI Core (Primary Engine Utilizing GCP project cprnd-496814)
-        const runVertex = async () => {
-            const vertexModels = ["gemini-2.5-flash", "gemini-3.5-flash", "gemini-3.1-flash-lite"];
-            for (const modelName of vertexModels) {
-                try {
-                    console.log(`Attempting Vertex AI model: ${modelName}`);
-                    const model = vertexAI.preview.getGenerativeModel({
-                        model: modelName,
-                        systemInstruction: { parts: [{ text: fullSystemPrompt }] },
-                        generationConfig: {
-                            temperature: 0.15,
-                            maxOutputTokens: 2048
-                        }
-                    });
-
-                    const rawHistory = messages.slice(0, -1);
-                    const mappedHistory = rawHistory.map(msg => ({
-                        role: msg.role === 'model' ? 'model' : 'user',
-                        parts: [{ text: msg.content || '' }]
-                    })).filter(msg => msg.parts[0].text.trim() !== '');
-
-                    const sanitizedHistory = [];
-                    for (const msg of mappedHistory) {
-                        if (sanitizedHistory.length > 0 && sanitizedHistory[sanitizedHistory.length - 1].role === msg.role) {
-                            sanitizedHistory[sanitizedHistory.length - 1].parts[0].text += "\n\n" + msg.parts[0].text;
-                        } else {
-                            sanitizedHistory.push(msg);
-                        }
-                    }
-                    while (sanitizedHistory.length > 0 && sanitizedHistory[0].role !== 'user') {
-                        sanitizedHistory.shift();
-                    }
-                    while (sanitizedHistory.length > 0 && sanitizedHistory[sanitizedHistory.length - 1].role !== 'model') {
-                        sanitizedHistory.pop();
-                    }
-
-                    const chat = model.startChat({ history: sanitizedHistory });
-
-                    let promptParts = [userMessageText];
-                    if (attachment && attachment.type === 'document') {
-                        promptParts[0] = `[ATTACHED FILE: ${attachment.name}]\n${attachment.content}\n\nUser Question: ${userMessageText}`;
-                    }
-
-                    if (attachment && attachment.type === 'image' && attachment.base64) {
-                        const matches = attachment.base64.match(/^data:(image\/[a-zA-Z]+);base64,(.+)$/);
-                        if (matches && matches.length === 3) {
-                            promptParts.push({
-                                inlineData: { data: matches[2], mimeType: matches[1] }
-                            });
-                        }
-                    }
-
-                    const result = await chat.sendMessage(promptParts);
-                    const response = await result.response;
-                    responseText = response.candidates?.[0]?.content?.parts?.[0]?.text || '';
-                    console.log(`🟢 Vertex AI model SUCCESS: ${modelName}`);
-                    return true;
-                } catch (err) {
-                    console.warn(`Vertex AI model ${modelName} failed:`, err.message);
-                    vertexError = err.message;
-                }
-            }
-            return false;
-        };
-
-        // Execute Claude Core (NUZ Mind)
-        const runClaude = async () => {
-            if (!claudeApiKey) {
-                claudeError = "Claude API Key is missing in env.";
+        // Execute Nvidia Core (DeepSeek-v4-flash)
+        const runNvidia = async () => {
+            if (!nvidiaApiKey) {
+                nvidiaError = "Nvidia API Key is missing in env.";
                 return false;
             }
-            const sdk = new Anthropic({ apiKey: claudeApiKey });
-            const claudeModels = ["claude-sonnet-4-6", "claude-3-5-sonnet-20241022", "claude-3-5-sonnet-latest"];
-            
-            for (const modelName of claudeModels) {
-                try {
-                    console.log(`Attempting Claude model: ${modelName}`);
-                    let contentBlocks = [];
-                    let claudeUserMessage = userMessageText;
-
-                    if (attachment && attachment.type === 'document') {
-                        claudeUserMessage = `[ATTACHED FILE: ${attachment.name}]\n${attachment.content}\n\nUser Question: ${userMessageText}`;
-                    }
-                    contentBlocks.push({ type: "text", text: claudeUserMessage });
-
-                    if (attachment && attachment.type === 'image' && attachment.base64) {
-                        const matches = attachment.base64.match(/^data:(image\/[a-zA-Z]+);base64,(.+)$/);
-                        if (matches && matches.length === 3) {
-                            contentBlocks.push({
-                                type: "image",
-                                source: { type: "base64", media_type: matches[1], data: matches[2] }
-                            });
-                        }
-                    }
-
-                    // Robust history sanitization for Claude: ensure strictly alternating user/assistant roles,
-                    // starting with user, ending with assistant, and merging consecutive identical roles.
-                    const rawClaudeHistory = messages.slice(0, -1);
-                    const mappedClaude = rawClaudeHistory.map(msg => ({
-                        role: msg.role === 'model' ? 'assistant' : 'user',
+            try {
+                console.log("Attempting Nvidia DeepSeek model: deepseek-ai/deepseek-v4-flash");
+                
+                const apiMessages = [];
+                const rawHistory = messages.slice(0, -1);
+                for (const msg of rawHistory) {
+                    apiMessages.push({
+                        role: msg.role === 'model' || msg.role === 'assistant' ? 'assistant' : 'user',
                         content: msg.content || ''
-                    })).filter(msg => msg.content.trim() !== '');
-
-                    const sanitizedClaudeHistory = [];
-                    for (const msg of mappedClaude) {
-                        if (sanitizedClaudeHistory.length > 0 && sanitizedClaudeHistory[sanitizedClaudeHistory.length - 1].role === msg.role) {
-                            sanitizedClaudeHistory[sanitizedClaudeHistory.length - 1].content += "\n\n" + msg.content;
-                        } else {
-                            sanitizedClaudeHistory.push(msg);
-                        }
-                    }
-                    while (sanitizedClaudeHistory.length > 0 && sanitizedClaudeHistory[0].role !== 'user') {
-                        sanitizedClaudeHistory.shift();
-                    }
-                    while (sanitizedClaudeHistory.length > 0 && sanitizedClaudeHistory[sanitizedClaudeHistory.length - 1].role !== 'assistant') {
-                        sanitizedClaudeHistory.pop();
-                    }
-                    
-                    sanitizedClaudeHistory.push({ role: "user", content: contentBlocks });
-
-                    const responseMessage = await sdk.messages.create({
-                        model: modelName,
-                        max_tokens: 1500,
-                        system: fullSystemPrompt,
-                        messages: sanitizedClaudeHistory
                     });
-                    responseText = responseMessage.content[0].text;
-                    console.log(`🟢 Claude model SUCCESS: ${modelName}`);
-                    return true;
-                } catch (err) {
-                    console.warn(`Claude model ${modelName} failed:`, err.message);
-                    claudeError = err.message;
-                    // Fast-fail if credentials/billing/quota issues arise
-                    const errMsg = (err.message || "").toLowerCase();
-                    const isBillingOrQuota = 
-                        errMsg.includes('depleted') || 
-                        errMsg.includes('billing') || 
-                        errMsg.includes('429') || 
-                        errMsg.includes('quota') || 
-                        errMsg.includes('exhausted') || 
-                        errMsg.includes('api key') || 
-                        errMsg.includes('not valid') ||
-                        errMsg.includes('invalid') ||
-                        errMsg.includes('credit') ||
-                        err.status === 429 ||
-                        err.statusCode === 429 ||
-                        err.status === 403 ||
-                        err.statusCode === 403 ||
-                        err.status === 401 ||
-                        err.statusCode === 401;
-
-                    if (isBillingOrQuota) {
-                        console.warn("Claude API key, billing, or quota issue. Skipping other Claude models instantly.");
-                        break;
-                    }
                 }
-            }
-            return false;
-        };
 
-        // Execute Gemini Core (NUZ Core)
-        const runGemini = async () => {
-            if (!geminiApiKey) {
-                geminiError = "Gemini API Key is missing in env.";
+                let finalUserContent = userMessageText;
+                if (attachment && attachment.type === 'document') {
+                    finalUserContent = `[ATTACHED FILE: ${attachment.name}]\n${attachment.content}\n\nUser Question: ${userMessageText}`;
+                } else if (attachment && attachment.type === 'image') {
+                    finalUserContent = `[ATTACHED IMAGE: ${attachment.name} (Image input not supported by this cognitive core)]\n\nUser Question: ${userMessageText}`;
+                }
+                apiMessages.push({
+                    role: 'user',
+                    content: finalUserContent
+                });
+
+                const response = await fetch("https://integrate.api.nvidia.com/v1/chat/completions", {
+                    method: "POST",
+                    headers: {
+                        "Content-Type": "application/json",
+                        "Authorization": `Bearer ${nvidiaApiKey}`
+                    },
+                    body: JSON.stringify({
+                        model: "deepseek-ai/deepseek-v4-flash",
+                        messages: [
+                            { role: "system", content: fullSystemPrompt },
+                            ...apiMessages
+                        ],
+                        temperature: 1,
+                        top_p: 0.95,
+                        max_tokens: 16384,
+                        chat_template_kwargs: {
+                            thinking: true,
+                            reasoning_effort: "high"
+                        },
+                        stream: false
+                    })
+                });
+
+                if (!response.ok) {
+                    const errText = await response.text();
+                    throw new Error(`Nvidia API error: ${response.status} - ${errText}`);
+                }
+
+                const data = await response.json();
+                const message = data.choices?.[0]?.message;
+                const content = message?.content || '';
+                const reasoning = message?.reasoning || message?.reasoning_content || '';
+                responseText = reasoning 
+                    ? `<details>\n<summary>Thinking Process</summary>\n\n${reasoning}\n</details>\n\n${content}`
+                    : content;
+
+                console.log("🟢 Nvidia model SUCCESS: deepseek-ai/deepseek-v4-flash");
+                return true;
+            } catch (err) {
+                console.warn("Nvidia model failed:", err.message);
+                nvidiaError = err.message;
                 return false;
             }
-            const genAI = new GoogleGenerativeAI(geminiApiKey);
-            // Optimized: Default heavily to gemini-2.5-flash and gemini-1.5-flash with low temperature for ultra-fast responses
-            const geminiModels = ["gemini-2.5-flash", "gemini-1.5-flash", "gemini-flash-latest"];
-            
-            for (const modelName of geminiModels) {
-                try {
-                    console.log(`Attempting Gemini model: ${modelName}`);
-                    const model = genAI.getGenerativeModel({
-                        model: modelName,
-                        systemInstruction: fullSystemPrompt,
-                        generationConfig: {
-                            temperature: 0.15, // Ultra-low temperature for sub-second, highly focused responses
-                            maxOutputTokens: 2048
-                        }
-                    });
-
-                    // Robust history sanitization for Gemini: ensure strictly alternating user/model roles,
-                    // starting with user, ending with model, and merging consecutive identical roles.
-                    const rawGeminiHistory = messages.slice(0, -1);
-                    const mappedGemini = rawGeminiHistory.map(msg => ({
-                        role: msg.role === 'model' ? 'model' : 'user',
-                        parts: [{ text: msg.content || '' }]
-                    })).filter(msg => msg.parts[0].text.trim() !== '');
-
-                    const sanitizedHistory = [];
-                    for (const msg of mappedGemini) {
-                        if (sanitizedHistory.length > 0 && sanitizedHistory[sanitizedHistory.length - 1].role === msg.role) {
-                            sanitizedHistory[sanitizedHistory.length - 1].parts[0].text += "\n\n" + msg.parts[0].text;
-                        } else {
-                            sanitizedHistory.push(msg);
-                        }
-                    }
-                    while (sanitizedHistory.length > 0 && sanitizedHistory[0].role !== 'user') {
-                        sanitizedHistory.shift();
-                    }
-                    while (sanitizedHistory.length > 0 && sanitizedHistory[sanitizedHistory.length - 1].role !== 'model') {
-                        sanitizedHistory.pop();
-                    }
-
-                    const chat = model.startChat({ history: sanitizedHistory });
-
-                    let promptParts = [userMessageText];
-                    if (attachment && attachment.type === 'document') {
-                        promptParts[0] = `[ATTACHED FILE: ${attachment.name}]\n${attachment.content}\n\nUser Question: ${userMessageText}`;
-                    }
-
-                    if (attachment && attachment.type === 'image' && attachment.base64) {
-                        const matches = attachment.base64.match(/^data:(image\/[a-zA-Z]+);base64,(.+)$/);
-                        if (matches && matches.length === 3) {
-                            promptParts.push({
-                                inlineData: { data: matches[2], mimeType: matches[1] }
-                            });
-                        }
-                    }
-
-                    const result = await chat.sendMessage(promptParts);
-                    const response = await result.response;
-                    responseText = response.text();
-                    console.log(`🟢 Gemini model SUCCESS: ${modelName}`);
-                    return true;
-                } catch (err) {
-                    console.warn(`Gemini model ${modelName} failed:`, err.message);
-                    geminiError = err.message;
-                    // Fast-fail if credentials/billing/quota issues arise
-                    const errMsg = (err.message || "").toLowerCase();
-                    const isBillingOrQuota = 
-                        errMsg.includes('depleted') || 
-                        errMsg.includes('billing') || 
-                        errMsg.includes('429') || 
-                        errMsg.includes('quota') || 
-                        errMsg.includes('exhausted') || 
-                        errMsg.includes('api key') || 
-                        errMsg.includes('not valid') ||
-                        errMsg.includes('invalid') ||
-                        errMsg.includes('credit') ||
-                        err.status === 429 ||
-                        err.statusCode === 429 ||
-                        err.status === 403 ||
-                        err.statusCode === 403 ||
-                        err.status === 401 ||
-                        err.statusCode === 401;
-
-                    if (isBillingOrQuota) {
-                        console.warn("Gemini API key, billing, or quota issue. Skipping other Gemini models instantly.");
-                        break;
-                    }
-                }
-            }
-            return false;
         };
 
         // Priority flow: Vertex AI is the primary cognitive engine.
-        // It falls back to Key-based APIs (Claude or Gemini) only if Vertex AI execution fails.
+        // It falls back to Nvidia (DeepSeek) only if Vertex AI execution fails.
         let success = false;
         console.log(`[Cognitive Routing] Prioritizing Vertex AI Primary Engine (gemini-2.5-flash)...`);
         success = await runVertex();
         
         if (!success) {
-            console.log("Vertex AI Primary Engine failed. Falling back to key-based API engines...");
-            if (requestedModel === 'claude') {
-                success = await runClaude();
-                if (!success) {
-                    console.log("Claude fallback model failed. Falling back to Gemini API...");
-                    success = await runGemini();
-                }
-            } else {
-                success = await runGemini();
-                if (!success) {
-                    console.log("Gemini fallback model failed. Falling back to Claude API...");
-                    success = await runClaude();
-                }
-            }
+            console.log("Vertex AI Primary Engine failed. Falling back to Nvidia API...");
+            success = await runNvidia();
         }
 
         if (!success || !responseText) {
             console.warn(`[API RESILIENCE fallback]: All cloud engines failed to respond. Attempting local trained brain matching...`);
-            console.warn(`Vertex error: ${vertexError} | Claude error: ${claudeError} | Gemini error: ${geminiError}`);
+            console.warn(`Vertex error: ${vertexError} | Nvidia error: ${nvidiaError}`);
             
             try {
                 const matchedDocs = await searchLocalKnowledge(userEmail || 'sulaiman@cloudpartners.biz', userMessageText);
@@ -1172,6 +995,12 @@ app.get('*', (req, res) => {
     res.sendFile(indexPath);
 });
 
-app.listen(port, () => {
-    console.log(`NUZ Workspace Backend running on port ${port}`);
-});
+// Only start listening when run directly (not on Vercel serverless)
+if (process.env.VERCEL !== '1') {
+    app.listen(port, () => {
+        console.log(`NUZ Workspace Backend running on port ${port}`);
+    });
+}
+
+// Export for Vercel serverless function handler
+module.exports = app;
