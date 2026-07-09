@@ -1,0 +1,16 @@
+{
+  "name": "nuz-ai-backend",
+  "version": "1.0.0",
+  "description": "Nuz AI Backend for Cloud Partners",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "cors": "^2.8.5",
+    "@google-cloud/firestore": "^7.3.0",
+    "@google/generative-ai": "^0.1.1",
+    "@anthropic-ai/sdk": "^0.30.0"
+  }
+}

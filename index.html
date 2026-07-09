@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Nuz AI | Cloud Partners</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <div id="app" class="nuz-chat-container">
+        <!-- Messages will be injected here dynamically -->
+        <div class="nuz-message-bubble" style="animation-delay: 0.1s;">
+            Welcome to Nuz AI! As your productivity companion at Cloud Partners, I can assist you with our services across www.cloudpartners.biz, www.zohocloud.lk, and www.googleapps.lk. How can I help you today?
+        </div>
+    </div>
+    
+    <script>
+        // Frontend logic to communicate with your backend running on GCP Cloud Run
+        // Backend URL will be your deployed Cloud Run URL
+        const BACKEND_URL = 'https://nuz-ai-backend-cprnd-496814.run.app/api/chat'; 
+
+        async function sendMessage(content) {
+            try {
+                const response = await fetch(BACKEND_URL, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ userId: 'sulaiman@cloudpartners.biz', role: 'user', content })
+                });
+                const data = await response.json();
+                console.log('Message saved:', data);
+            } catch (error) {
+                console.error('Error:', error);
+            }
+        }
+    </script>
+</body>
+</html>

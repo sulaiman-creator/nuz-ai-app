@@ -1,0 +1,27 @@
+steps:
+# Step 1: Build the Docker image
+- name: 'gcr.io/cloud-builders/docker'
+  args: ['build', '-t', 'gcr.io/cprnd-496814/nuz-ai-backend:$COMMIT_SHA', '.']
+
+# Step 2: Push the image to Google Container Registry
+- name: 'gcr.io/cloud-builders/docker'
+  args: ['push', 'gcr.io/cprnd-496814/nuz-ai-backend:$COMMIT_SHA']
+
+# Step 3: Deploy the image to Google Cloud Run
+- name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+  entrypoint: gcloud
+  args:
+  - 'run'
+  - 'deploy'
+  - 'nuz-ai-backend'
+  - '--image'
+  - 'gcr.io/cprnd-496814/nuz-ai-backend:$COMMIT_SHA'
+  - '--region'
+  - 'us-central1'
+  - '--platform'
+  - 'managed'
+  - '--allow-unauthenticated'
+
+# Define images to be pushed
+images:
+- 'gcr.io/cprnd-496814/nuz-ai-backend:$COMMIT_SHA'

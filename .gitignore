@@ -1,0 +1,40 @@
+# Dependencies
+node_modules/
+/dist
+/backend/dist
+/frontend/dist
+
+# Environment variables & local secrets
+.env
+.env.*
+local.properties
+
+# Android build outputs and caches
+.gradle/
+.kotlin/
+/build/
+/app/build/
+/android/build/
+/android/app/build/
+*.apk
+*.aar
+*.jar
+
+# IDE & Editor caches
+.idea/
+.vscode/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# JVM Diagnostics and Heap Dumps
+*.hprof
+hs_err_pid*
+
+# Operating System files
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+.DS_Store

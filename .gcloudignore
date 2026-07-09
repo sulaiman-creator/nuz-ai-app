@@ -1,0 +1,13 @@
+# .gcloudignore
+# Prevent uploading unnecessary directories to Cloud Build
+**/node_modules/
+**/dist/
+.git/
+android/
+.gradle/
+.idea/
+build/
+gradle/
+gradlew*
+local.properties
+settings.gradle.kts
