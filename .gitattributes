@@ -1,0 +1,4 @@
+# Force LF line endings for shell scripts to prevent Windows CRLF issues on Linux CI/CD runners
+gradlew text eol=lf
+android/gradlew text eol=lf
+deploy.sh text eol=lf
