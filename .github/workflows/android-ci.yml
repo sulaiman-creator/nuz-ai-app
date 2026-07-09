@@ -24,13 +24,16 @@ jobs:
 
       - name: Grant execute permission for gradlew
         run: chmod +x ./gradlew
+        working-directory: android
 
       - name: Build Debug APK
-        run: ./gradlew :android:app:assembleDebug
+        run: ./gradlew :app:assembleDebug
+        working-directory: android
 
       # Run unit tests
       - name: Run Unit Tests
-        run: ./gradlew :android:app:testDebugUnitTest
+        run: ./gradlew :app:testDebugUnitTest
+        working-directory: android
 
       # Upload the generated APK as an artifact so you can download it
       - name: Upload APK Artifact
